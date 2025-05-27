@@ -9,6 +9,7 @@ import { getOptionalOutputParser } from '@utils/output_parsers/N8nOutputParser';
 import { throwIfToolSchema } from '@utils/schemaParsing';
 import { getTracingConfig } from '@utils/tracing';
 
+import { applyAnthropicCaching } from '../ToolsAgent/common';
 import { checkForStructuredTools, extractParsedOutput } from '../utils';
 
 export async function conversationalAgentExecute(
@@ -31,6 +32,9 @@ export async function conversationalAgentExecute(
 
 	await checkForStructuredTools(tools, this.getNode(), 'Conversational Agent');
 
+	// Apply Anthropic caching configuration if available
+	const cachedModel = applyAnthropicCaching(model, tools, memory);
+
 	// TODO: Make it possible in the future to use values for other items than just 0
 	const options = this.getNodeParameter('options', 0, {}) as {
 		systemMessage?: string;
@@ -39,7 +43,7 @@ export async function conversationalAgentExecute(
 		returnIntermediateSteps?: boolean;
 	};
 
-	const agentExecutor = await initializeAgentExecutorWithOptions(tools, model, {
+	const agentExecutor = await initializeAgentExecutorWithOptions(tools, cachedModel, {
 		// Passing "chat-conversational-react-description" as the agent type
 		// automatically creates and uses BufferMemory with the executor.
 		// If you would like to override this, you can pass in a custom

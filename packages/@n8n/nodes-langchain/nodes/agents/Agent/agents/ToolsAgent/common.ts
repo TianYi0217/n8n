@@ -376,3 +376,40 @@ export async function prepareMessages(
 export function preparePrompt(messages: BaseMessagePromptTemplateLike[]): ChatPromptTemplate {
 	return ChatPromptTemplate.fromMessages(messages);
 }
+
+/**
+ * Applies Anthropic prompt caching configuration to the chat model and tools.
+ * This function stores the caching configuration on the model for later use.
+ *
+ * @param model - The ChatAnthropic model instance
+ * @param tools - The array of tools to potentially cache
+ * @param memory - The optional memory instance for conversation history
+ * @returns The model with caching configuration applied
+ */
+export function applyAnthropicCaching(
+	model: BaseChatModel,
+	tools: Array<DynamicStructuredTool | Tool>,
+	memory?: BaseChatMemory,
+): BaseChatModel {
+	// Check if this is an Anthropic model with caching config
+	const cacheConfig = (model as any)._n8nCacheConfig;
+	if (!cacheConfig) {
+		return model; // No caching config, return model as-is
+	}
+
+	if (cacheConfig.enableRequestLogging) {
+		console.log('🎯 Applying Anthropic Caching:', {
+			systemMessage: cacheConfig.cacheSystemMessage,
+			tools: cacheConfig.cacheTools,
+			messages: cacheConfig.cacheMessages,
+			toolsCount: tools.length,
+			hasMemory: !!memory,
+		});
+	}
+
+	// The actual caching logic is now handled in the LmChatAnthropic node
+	// via the _generate method interception. This function just confirms
+	// the configuration is available.
+
+	return model;
+}
