@@ -8,6 +8,7 @@ import { getPromptInputByType } from '@utils/helpers';
 import { getOptionalOutputParser } from '@utils/output_parsers/N8nOutputParser';
 
 import {
+	applyAnthropicCaching,
 	fixEmptyContentMessage,
 	getAgentStepsParser,
 	getChatModel,
@@ -50,7 +51,7 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				promptTypeKey: 'promptType',
 			});
 			if (input === undefined) {
-				throw new NodeOperationError(this.getNode(), 'The “text” parameter is empty.');
+				throw new NodeOperationError(this.getNode(), 'The "text" parameter is empty.');
 			}
 
 			const options = this.getNodeParameter('options', itemIndex, {}) as {
@@ -59,6 +60,9 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 				returnIntermediateSteps?: boolean;
 				passthroughBinaryImages?: boolean;
 			};
+
+			// Apply Anthropic caching configuration if available
+			const cachedModel = applyAnthropicCaching(model, tools, memory);
 
 			// Prepare the prompt messages and prompt template.
 			const messages = await prepareMessages(this, itemIndex, {
@@ -70,7 +74,7 @@ export async function toolsAgentExecute(this: IExecuteFunctions): Promise<INodeE
 
 			// Create the base agent that calls tools.
 			const agent = createToolCallingAgent({
-				llm: model,
+				llm: cachedModel,
 				tools,
 				prompt,
 				streamRunnable: false,
