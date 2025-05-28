@@ -481,6 +481,166 @@ export class LmChatAnthropic implements INodeType {
 		// Create custom callbacks array for logging
 		const callbacks = [new N8nLlmTracing(this, { tokensUsageParser })];
 
+		// Create cache handling callback - THIS SHOULD ALWAYS BE ADDED WHEN CACHING IS ENABLED
+		const cacheCallback = {
+			handleChatModelStart: async (llm: any, messages: any[][], runId: string) => {
+				if (promptCaching.enableRequestLogging) {
+					console.log('💬 Chat Model Start - FOUND THE MESSAGES!:', {
+						runId,
+						messageGroupCount: messages.length,
+						firstGroupLength: messages[0]?.length || 0,
+						allMessages: messages.flat().map((msg: any, index: number) => ({
+							index,
+							type: msg?.type || msg?.role || msg?._getType?.() || 'unknown',
+							contentType: Array.isArray(msg?.content) ? 'array' : typeof msg?.content,
+							hasContent: !!msg?.content,
+							contentSample:
+								typeof msg?.content === 'string'
+									? msg.content.substring(0, 100) + '...'
+									: '[object/array]',
+						})),
+					});
+				}
+
+				// Apply caching to the messages - THIS RUNS REGARDLESS OF LOGGING SETTING
+				if (messages && messages.length > 0 && Array.isArray(messages[0])) {
+					const flatMessages = messages.flat();
+					if (promptCaching.enableRequestLogging) {
+						console.log('🎯 Applying cache control to chat messages...');
+					}
+
+					let cacheMarkersAdded = 0;
+					const maxCacheMarkers = 4;
+
+					// Strategy: Cache stable content that won't change between requests
+					// 1. Always cache system message (index 0)
+					// 2. Cache conversation at strategic points (last message and 3rd from last)
+					// 3. Cache tool messages if enabled
+
+					flatMessages.forEach((msg: any, index: number) => {
+						if (cacheMarkersAdded >= maxCacheMarkers) return;
+
+						const messageType = msg?.type || msg?.role || msg?._getType?.() || '';
+						let shouldCache = false;
+						let reason = '';
+
+						// 1. System message caching - always cache the first system message
+						if (
+							promptCaching.cacheSystemMessage &&
+							(messageType === 'system' || messageType === 'SystemMessage') &&
+							index === 0
+						) {
+							shouldCache = true;
+							reason = 'system message (index 0)';
+						}
+						// 2. Tool message caching
+						else if (
+							promptCaching.cacheTools &&
+							(messageType === 'tool' || messageType === 'ToolMessage' || msg.tool_calls)
+						) {
+							shouldCache = true;
+							reason = 'tool message';
+						}
+						// 3. Conversation history caching - cache last message and 3rd from last
+						else if (promptCaching.cacheMessages && cacheMarkersAdded < maxCacheMarkers - 1) {
+							const isLastMessage = index === flatMessages.length - 1;
+							const isThirdFromLast = index === flatMessages.length - 3;
+
+							if (isLastMessage) {
+								shouldCache = true;
+								reason = `last message (index ${index})`;
+							} else if (isThirdFromLast && flatMessages.length >= 3) {
+								shouldCache = true;
+								reason = `3rd from last message (index ${index})`;
+							}
+						}
+
+						if (shouldCache && cacheMarkersAdded < maxCacheMarkers) {
+							const success = addCacheControlToMessage(msg);
+							if (success) {
+								cacheMarkersAdded++;
+								if (promptCaching.enableRequestLogging) {
+									console.log(
+										`💾 Added cache_control to ${reason} (marker ${cacheMarkersAdded}/${maxCacheMarkers})`,
+									);
+
+									// Debug: Show the actual message structure after adding cache_control
+									console.log(`🔍 Message ${index} after cache_control added:`, {
+										type: msg?.type || msg?.role,
+										contentType: Array.isArray(msg.content) ? 'array' : typeof msg.content,
+										contentStructure: Array.isArray(msg.content)
+											? msg.content.map((block: any, i: number) => ({
+													blockIndex: i,
+													type: block?.type,
+													hasCacheControl: !!block?.cache_control,
+													cacheControlValue: block?.cache_control,
+												}))
+											: {
+													hasCacheControl: !!msg.content?.cache_control,
+													cacheControlValue: msg.content?.cache_control,
+												},
+									});
+								}
+							}
+						}
+					});
+
+					if (promptCaching.enableRequestLogging) {
+						console.log(
+							`✅ Cache strategy applied: ${cacheMarkersAdded}/${maxCacheMarkers} cache markers added`,
+						);
+
+						// Final debug: Show the complete message structure that will be sent
+						console.log('📤 Final Message Structure (first 3 messages):');
+						flatMessages.slice(0, 3).forEach((msg, idx) => {
+							console.log(`Message ${idx}:`, {
+								type: msg?.type || msg?.role,
+								contentPreview:
+									typeof msg.content === 'string'
+										? msg.content.substring(0, 50) + '...'
+										: '[complex content]',
+								contentStructure: Array.isArray(msg.content)
+									? `Array[${msg.content.length}] with cache_control: ${msg.content.some((b: any) => b?.cache_control)}`
+									: `${typeof msg.content} with cache_control: ${!!msg.content?.cache_control}`,
+							});
+						});
+
+						console.log(`... (showing 3 of ${flatMessages.length} total messages)`);
+
+						// Show actual cache_control values for debugging
+						const messagesWithCache = flatMessages.filter((msg, idx) => {
+							if (Array.isArray(msg.content)) {
+								return msg.content.some((block: any) => block?.cache_control);
+							} else if (msg.content?.cache_control) {
+								return true;
+							}
+							return false;
+						});
+
+						console.log('🏷️  Messages with cache_control:', {
+							count: messagesWithCache.length,
+							indices: messagesWithCache.map((_, idx) =>
+								flatMessages.findIndex((m) => m === messagesWithCache[idx]),
+							),
+							sampleCacheControl:
+								messagesWithCache[0] && Array.isArray(messagesWithCache[0].content)
+									? messagesWithCache[0].content.find((b: any) => b?.cache_control)?.cache_control
+									: messagesWithCache[0]?.content?.cache_control,
+						});
+					}
+				}
+			},
+		} as any;
+
+		// Always add cache callback if any caching is enabled
+		if (
+			promptCaching.cacheSystemMessage ||
+			promptCaching.cacheTools ||
+			promptCaching.cacheMessages
+		) {
+			callbacks.push(cacheCallback);
+		}
+
 		// Add request logging callback if enabled
 		if (promptCaching.enableRequestLogging) {
 			callbacks.push({
@@ -503,163 +663,18 @@ export class LmChatAnthropic implements INodeType {
 					});
 
 					// Enhanced debugging for API response
-					if (promptCaching.enableRequestLogging) {
-						console.log('🔍 Full LLM Response Debug:', {
-							hasLlmOutput: !!output.llmOutput,
-							outputKeys: output ? Object.keys(output) : 'no output',
-							llmOutputKeys: output.llmOutput ? Object.keys(output.llmOutput) : 'no llmOutput',
-							generations: output.generations?.length || 0,
-							firstGeneration: output.generations?.[0]
-								? {
-										text: output.generations[0].text?.substring(0, 100) + '...',
-										keys: Object.keys(output.generations[0]),
-									}
-								: 'no generations',
-						});
-					}
-				},
-				handleChatModelStart: async (llm: any, messages: any[][], runId: string) => {
-					console.log('💬 Chat Model Start - FOUND THE MESSAGES!:', {
-						runId,
-						messageGroupCount: messages.length,
-						firstGroupLength: messages[0]?.length || 0,
-						allMessages: messages.flat().map((msg: any, index: number) => ({
-							index,
-							type: msg?.type || msg?.role || msg?._getType?.() || 'unknown',
-							contentType: Array.isArray(msg?.content) ? 'array' : typeof msg?.content,
-							hasContent: !!msg?.content,
-							contentSample:
-								typeof msg?.content === 'string'
-									? msg.content.substring(0, 100) + '...'
-									: '[object/array]',
-						})),
+					console.log('🔍 Full LLM Response Debug:', {
+						hasLlmOutput: !!output.llmOutput,
+						outputKeys: output ? Object.keys(output) : 'no output',
+						llmOutputKeys: output.llmOutput ? Object.keys(output.llmOutput) : 'no llmOutput',
+						generations: output.generations?.length || 0,
+						firstGeneration: output.generations?.[0]
+							? {
+									text: output.generations[0].text?.substring(0, 100) + '...',
+									keys: Object.keys(output.generations[0]),
+								}
+							: 'no generations',
 					});
-
-					// Apply caching to the messages
-					if (messages && messages.length > 0 && Array.isArray(messages[0])) {
-						const flatMessages = messages.flat();
-						console.log('🎯 Applying cache control to chat messages...');
-
-						let cacheMarkersAdded = 0;
-						const maxCacheMarkers = 4;
-
-						// Strategy: Cache stable content that won't change between requests
-						// 1. Always cache system message (index 0)
-						// 2. Cache conversation at strategic points (last message and 3rd from last)
-						// 3. Cache tool messages if enabled
-
-						flatMessages.forEach((msg: any, index: number) => {
-							if (cacheMarkersAdded >= maxCacheMarkers) return;
-
-							const messageType = msg?.type || msg?.role || msg?._getType?.() || '';
-							let shouldCache = false;
-							let reason = '';
-
-							// 1. System message caching - always cache the first system message
-							if (
-								promptCaching.cacheSystemMessage &&
-								(messageType === 'system' || messageType === 'SystemMessage') &&
-								index === 0
-							) {
-								shouldCache = true;
-								reason = 'system message (index 0)';
-							}
-							// 2. Tool message caching
-							else if (
-								promptCaching.cacheTools &&
-								(messageType === 'tool' || messageType === 'ToolMessage' || msg.tool_calls)
-							) {
-								shouldCache = true;
-								reason = 'tool message';
-							}
-							// 3. Conversation history caching - cache last message and 3rd from last
-							else if (promptCaching.cacheMessages && cacheMarkersAdded < maxCacheMarkers - 1) {
-								const isLastMessage = index === flatMessages.length - 1;
-								const isThirdFromLast = index === flatMessages.length - 3;
-
-								if (isLastMessage) {
-									shouldCache = true;
-									reason = `last message (index ${index})`;
-								} else if (isThirdFromLast && flatMessages.length >= 3) {
-									shouldCache = true;
-									reason = `3rd from last message (index ${index})`;
-								}
-							}
-
-							if (shouldCache && cacheMarkersAdded < maxCacheMarkers) {
-								const success = addCacheControlToMessage(msg);
-								if (success) {
-									cacheMarkersAdded++;
-									console.log(
-										`💾 Added cache_control to ${reason} (marker ${cacheMarkersAdded}/${maxCacheMarkers})`,
-									);
-
-									// Debug: Show the actual message structure after adding cache_control
-									if (promptCaching.enableRequestLogging) {
-										console.log(`🔍 Message ${index} after cache_control added:`, {
-											type: msg?.type || msg?.role,
-											contentType: Array.isArray(msg.content) ? 'array' : typeof msg.content,
-											contentStructure: Array.isArray(msg.content)
-												? msg.content.map((block: any, i: number) => ({
-														blockIndex: i,
-														type: block?.type,
-														hasCacheControl: !!block?.cache_control,
-														cacheControlValue: block?.cache_control,
-													}))
-												: {
-														hasCacheControl: !!msg.content?.cache_control,
-														cacheControlValue: msg.content?.cache_control,
-													},
-										});
-									}
-								}
-							}
-						});
-
-						console.log(
-							`✅ Cache strategy applied: ${cacheMarkersAdded}/${maxCacheMarkers} cache markers added`,
-						);
-
-						// Final debug: Show the complete message structure that will be sent
-						if (promptCaching.enableRequestLogging) {
-							console.log('📤 Final Message Structure (first 3 messages):');
-							flatMessages.slice(0, 3).forEach((msg, idx) => {
-								console.log(`Message ${idx}:`, {
-									type: msg?.type || msg?.role,
-									contentPreview:
-										typeof msg.content === 'string'
-											? msg.content.substring(0, 50) + '...'
-											: '[complex content]',
-									contentStructure: Array.isArray(msg.content)
-										? `Array[${msg.content.length}] with cache_control: ${msg.content.some((b: any) => b?.cache_control)}`
-										: `${typeof msg.content} with cache_control: ${!!msg.content?.cache_control}`,
-								});
-							});
-
-							console.log(`... (showing 3 of ${flatMessages.length} total messages)`);
-
-							// Show actual cache_control values for debugging
-							const messagesWithCache = flatMessages.filter((msg, idx) => {
-								if (Array.isArray(msg.content)) {
-									return msg.content.some((block: any) => block?.cache_control);
-								} else if (msg.content?.cache_control) {
-									return true;
-								}
-								return false;
-							});
-
-							console.log('🏷️  Messages with cache_control:', {
-								count: messagesWithCache.length,
-								indices: messagesWithCache.map((_, idx) =>
-									flatMessages.findIndex((m) => m === messagesWithCache[idx]),
-								),
-								sampleCacheControl:
-									messagesWithCache[0] && Array.isArray(messagesWithCache[0].content)
-										? messagesWithCache[0].content.find((b: any) => b?.cache_control)?.cache_control
-										: messagesWithCache[0]?.content?.cache_control,
-							});
-						}
-					}
 				},
 			} as any);
 		}
