@@ -2,7 +2,7 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ anthropic-caching-dev ]
     paths:
       - 'packages/@n8n/nodes-langchain/**'
       - 'packages/nodes-base/**'
