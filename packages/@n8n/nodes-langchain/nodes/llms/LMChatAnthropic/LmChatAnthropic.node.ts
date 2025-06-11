@@ -469,8 +469,42 @@ export class LmChatAnthropic implements INodeType {
 		// Create custom callbacks array for logging
 		const callbacks = [new N8nLlmTracing(this, { tokensUsageParser })];
 
-		// Note: Cache control is now applied only once in the direct API call interception
-		// to avoid duplication and ensure we never exceed the 4 cache block limit.
+		// Add a backup cache callback in case the API interception doesn't work
+		const backupCacheCallback = {
+			handleChatModelStart: async (llm: any, messages: any[][], runId: string) => {
+				if (promptCaching.enableRequestLogging) {
+					console.log('🔄 Backup cache callback triggered:', {
+						runId,
+						messageArrays: messages.length,
+					});
+				}
+
+				// Always apply cache control via backup since API interception failed
+				if (messages && messages.length > 0 && Array.isArray(messages[0])) {
+					const flatMessages = messages.flat();
+
+					if (
+						promptCaching.cacheSystemMessage ||
+						promptCaching.cacheTools ||
+						promptCaching.cacheMessages
+					) {
+						if (promptCaching.enableRequestLogging) {
+							console.log('🎯 API interception failed, applying cache control via backup callback');
+						}
+						applyFinalCacheControl(flatMessages, promptCaching);
+					}
+				}
+			},
+		} as any;
+
+		// Add backup callback if any caching is enabled
+		if (
+			promptCaching.cacheSystemMessage ||
+			promptCaching.cacheTools ||
+			promptCaching.cacheMessages
+		) {
+			callbacks.push(backupCacheCallback);
+		}
 
 		// Add request logging callback if enabled
 		if (promptCaching.enableRequestLogging) {
@@ -513,12 +547,26 @@ export class LmChatAnthropic implements INodeType {
 			},
 		});
 
-		// 添加直接的API响应拦截 - 这里是唯一应用缓存控制的地方
+		// 尝试多种API拦截方法
+		if (promptCaching.enableRequestLogging) {
+			console.log('🔍 Attempting API interception...', {
+				hasClient: !!(model as any).client,
+				hasAnthropicApiKey: !!(model as any).anthropicApiKey,
+				clientType: typeof (model as any).client,
+				clientKeys: (model as any).client ? Object.keys((model as any).client) : 'no client',
+			});
+		}
+
+		// 方法1: 尝试拦截 client.messages.create
 		const originalClient = (model as any).client;
 		if (originalClient && originalClient.messages && originalClient.messages.create) {
 			const originalCreate = originalClient.messages.create.bind(originalClient.messages);
 			originalClient.messages.create = async function (params: any) {
-				// 应用缓存控制逻辑 - 先清除所有现有的，然后重新添加最多4个
+				if (promptCaching.enableRequestLogging) {
+					console.log('🎯 API Interceptor (method 1) called');
+				}
+
+				// 应用缓存控制
 				if (
 					params.messages &&
 					Array.isArray(params.messages) &&
@@ -529,27 +577,79 @@ export class LmChatAnthropic implements INodeType {
 					applyFinalCacheControl(params.messages, promptCaching);
 				}
 
-				if (promptCaching.enableRequestLogging) {
-					const cacheBlockCount =
-						params.messages?.filter((msg: any) =>
-							Array.isArray(msg.content)
-								? msg.content.some((block: any) => block.cache_control)
-								: msg.content?.cache_control,
-						).length || 0;
+				const response = await originalCreate(params);
+				return response;
+			};
 
-					console.log('🚀 Direct Anthropic API Call Params:', {
-						messages: params.messages?.length
-							? `${params.messages.length} messages`
-							: 'no messages',
-						model: params.model,
-						max_tokens: params.max_tokens,
-						cacheBlockCount: cacheBlockCount,
-					});
+			if (promptCaching.enableRequestLogging) {
+				console.log('✅ Successfully intercepted client.messages.create');
+			}
+		}
+		// 方法2: 尝试拦截 client.beta.messages.create (如果存在)
+		else if (
+			originalClient &&
+			originalClient.beta &&
+			originalClient.beta.messages &&
+			originalClient.beta.messages.create
+		) {
+			const originalCreate = originalClient.beta.messages.create.bind(originalClient.beta.messages);
+			originalClient.beta.messages.create = async function (params: any) {
+				if (promptCaching.enableRequestLogging) {
+					console.log('🎯 API Interceptor (method 2) called');
+				}
+
+				// 应用缓存控制
+				if (
+					params.messages &&
+					Array.isArray(params.messages) &&
+					(promptCaching.cacheSystemMessage ||
+						promptCaching.cacheTools ||
+						promptCaching.cacheMessages)
+				) {
+					applyFinalCacheControl(params.messages, promptCaching);
 				}
 
 				const response = await originalCreate(params);
 				return response;
 			};
+
+			if (promptCaching.enableRequestLogging) {
+				console.log('✅ Successfully intercepted client.beta.messages.create');
+			}
+		}
+		// 方法3: 尝试直接拦截创建函数
+		else if (originalClient && typeof originalClient.create === 'function') {
+			const originalCreate = originalClient.create.bind(originalClient);
+			originalClient.create = async function (params: any) {
+				if (promptCaching.enableRequestLogging) {
+					console.log('🎯 API Interceptor (method 3) called');
+				}
+
+				// 应用缓存控制
+				if (
+					params.messages &&
+					Array.isArray(params.messages) &&
+					(promptCaching.cacheSystemMessage ||
+						promptCaching.cacheTools ||
+						promptCaching.cacheMessages)
+				) {
+					applyFinalCacheControl(params.messages, promptCaching);
+				}
+
+				const response = await originalCreate(params);
+				return response;
+			};
+
+			if (promptCaching.enableRequestLogging) {
+				console.log('✅ Successfully intercepted client.create');
+			}
+		} else {
+			if (promptCaching.enableRequestLogging) {
+				console.log('⚠️ Could not find any API endpoint to intercept, will rely on backup callback');
+				if (originalClient) {
+					console.log('🔍 Available client methods:', Object.getOwnPropertyNames(originalClient));
+				}
+			}
 		}
 
 		// Store caching configuration on the model instance for use by agents
@@ -577,6 +677,39 @@ export class LmChatAnthropic implements INodeType {
 						// For _generate method, args[0] should be messages
 						if (methodName === '_generate' && args[0] && Array.isArray(args[0])) {
 							const messages = args[0];
+
+							if (promptCaching.enableRequestLogging) {
+								console.log(`🔍 ${methodName} called with messages:`, {
+									messageCount: messages.length,
+									messagesWithCache: messages.filter((msg: any) => {
+										if (Array.isArray(msg.content)) {
+											return msg.content.some((block: any) => block.cache_control);
+										}
+										return msg.content?.cache_control;
+									}).length,
+								});
+
+								// 显示前两条消息的详细结构
+								messages.slice(0, 2).forEach((msg: any, index: number) => {
+									console.log(`📨 Message ${index} structure:`, {
+										type: msg.type || msg.role,
+										contentType: Array.isArray(msg.content) ? 'array' : typeof msg.content,
+										hasCache: Array.isArray(msg.content)
+											? msg.content.some((block: any) => block.cache_control)
+											: !!msg.content?.cache_control,
+										firstContentBlock:
+											Array.isArray(msg.content) && msg.content[0]
+												? {
+														type: msg.content[0].type,
+														hasCache: !!msg.content[0].cache_control,
+														textPreview: msg.content[0].text
+															? msg.content[0].text.substring(0, 100) + '...'
+															: 'no text',
+													}
+												: 'not array',
+									});
+								});
+							}
 
 							// Note: Cache control is already applied in handleChatModelStart callback
 							// to avoid double application and exceeding the 4 cache block limit.
@@ -647,23 +780,44 @@ export class LmChatAnthropic implements INodeType {
  */
 function applyFinalCacheControl(messages: any[], cacheConfig: any): void {
 	if (!messages || !Array.isArray(messages) || !cacheConfig) {
+		if (cacheConfig?.enableRequestLogging) {
+			console.log('⚠️ applyFinalCacheControl: Invalid parameters');
+		}
 		return;
 	}
 
+	if (cacheConfig.enableRequestLogging) {
+		console.log('🔍 applyFinalCacheControl called:', {
+			messageCount: messages.length,
+			config: {
+				systemMessage: cacheConfig.cacheSystemMessage,
+				tools: cacheConfig.cacheTools,
+				messages: cacheConfig.cacheMessages,
+			},
+		});
+	}
+
 	// Step 1: 清除所有现有的缓存控制
-	messages.forEach((msg: any) => {
+	let removedCacheBlocks = 0;
+	messages.forEach((msg: any, index: number) => {
 		if (msg.content) {
 			if (Array.isArray(msg.content)) {
 				msg.content.forEach((block: any) => {
 					if (block.cache_control) {
 						delete block.cache_control;
+						removedCacheBlocks++;
 					}
 				});
 			} else if (typeof msg.content === 'object' && msg.content.cache_control) {
 				delete msg.content.cache_control;
+				removedCacheBlocks++;
 			}
 		}
 	});
+
+	if (cacheConfig.enableRequestLogging) {
+		console.log(`🧹 Cleaned ${removedCacheBlocks} existing cache blocks`);
+	}
 
 	// Step 2: 重新应用最多4个缓存控制
 	let cacheMarkersAdded = 0;
@@ -676,6 +830,9 @@ function applyFinalCacheControl(messages: any[], cacheConfig: any): void {
 			const messageType = messages[i]?.type || messages[i]?.role || '';
 			if (messageType === 'system' || messageType === 'SystemMessage') {
 				cacheTargets.push(i);
+				if (cacheConfig.enableRequestLogging) {
+					console.log(`🏷️ Found system message at index ${i}`);
+				}
 				break; // 只取最后一条系统消息
 			}
 		}
@@ -688,6 +845,9 @@ function applyFinalCacheControl(messages: any[], cacheConfig: any): void {
 			if (messageType === 'tool' || messageType === 'ToolMessage' || messages[i]?.tool_calls) {
 				if (!cacheTargets.includes(i)) {
 					cacheTargets.push(i);
+					if (cacheConfig.enableRequestLogging) {
+						console.log(`🔧 Found tool message at index ${i}`);
+					}
 					break; // 只取最后一条工具消息
 				}
 			}
@@ -701,6 +861,9 @@ function applyFinalCacheControl(messages: any[], cacheConfig: any): void {
 			const lastIndex = messages.length - 1;
 			if (!cacheTargets.includes(lastIndex)) {
 				cacheTargets.push(lastIndex);
+				if (cacheConfig.enableRequestLogging) {
+					console.log(`📝 Found last message at index ${lastIndex}`);
+				}
 			}
 		}
 
@@ -709,6 +872,9 @@ function applyFinalCacheControl(messages: any[], cacheConfig: any): void {
 			const thirdFromLastIndex = messages.length - 3;
 			if (!cacheTargets.includes(thirdFromLastIndex)) {
 				cacheTargets.push(thirdFromLastIndex);
+				if (cacheConfig.enableRequestLogging) {
+					console.log(`📝 Found third-from-last message at index ${thirdFromLastIndex}`);
+				}
 			}
 		}
 	}
@@ -719,6 +885,11 @@ function applyFinalCacheControl(messages: any[], cacheConfig: any): void {
 			const success = addCacheControlToMessage(messages[index]);
 			if (success) {
 				cacheMarkersAdded++;
+				if (cacheConfig.enableRequestLogging) {
+					console.log(`✅ Added cache control to message ${index}`);
+				}
+			} else if (cacheConfig.enableRequestLogging) {
+				console.log(`❌ Failed to add cache control to message ${index}`);
 			}
 		}
 	});
@@ -727,6 +898,36 @@ function applyFinalCacheControl(messages: any[], cacheConfig: any): void {
 		console.log(
 			`💾 Final cache control applied: ${cacheMarkersAdded}/${maxCacheMarkers} cache markers added to indices: [${cacheTargets.join(', ')}]`,
 		);
+
+		// 显示实际的消息结构用于调试
+		console.log('🔍 Final message structure with cache control:');
+		messages.forEach((msg, index) => {
+			const hasCache = Array.isArray(msg.content)
+				? msg.content.some((block: any) => block.cache_control)
+				: msg.content?.cache_control;
+
+			if (hasCache) {
+				console.log(`📋 Message ${index} (${msg.type || msg.role}):`, {
+					contentType: Array.isArray(msg.content) ? 'array' : typeof msg.content,
+					contentLength: Array.isArray(msg.content)
+						? msg.content.length
+						: typeof msg.content === 'string'
+							? msg.content.length
+							: 'object',
+					hasCache: hasCache,
+					content: Array.isArray(msg.content)
+						? msg.content.map((block: any) => ({
+								type: block.type,
+								hasCache: !!block.cache_control,
+								textLength: block.text ? block.text.length : 'no text',
+							}))
+						: {
+								hasCache: !!msg.content?.cache_control,
+								textLength: typeof msg.content === 'string' ? msg.content.length : 'object',
+							},
+				});
+			}
+		});
 	}
 }
 
@@ -736,8 +937,19 @@ function applyFinalCacheControl(messages: any[], cacheConfig: any): void {
  */
 function addCacheControlToMessage(msg: any): boolean {
 	if (!msg || !msg.content) {
+		console.log('🔍 addCacheControlToMessage: Invalid message or content');
 		return false;
 	}
+
+	console.log('🔍 addCacheControlToMessage: Processing message:', {
+		contentType: Array.isArray(msg.content) ? 'array' : typeof msg.content,
+		arrayLength: Array.isArray(msg.content) ? msg.content.length : 'not array',
+		contentSample: Array.isArray(msg.content)
+			? msg.content[0]
+			: typeof msg.content === 'string'
+				? msg.content.substring(0, 50) + '...'
+				: 'object',
+	});
 
 	try {
 		if (Array.isArray(msg.content)) {
@@ -745,10 +957,16 @@ function addCacheControlToMessage(msg: any): boolean {
 			const lastBlock = msg.content[msg.content.length - 1];
 			if (lastBlock && typeof lastBlock === 'object') {
 				lastBlock.cache_control = { type: 'ephemeral' };
+				console.log('✅ Added cache_control to array content, last block:', {
+					blockType: lastBlock.type,
+					hasCache: !!lastBlock.cache_control,
+					textLength: lastBlock.text ? lastBlock.text.length : 'no text',
+				});
 				return true;
 			}
 		} else if (typeof msg.content === 'string') {
 			// Content is a string - convert to content block format with cache_control
+			const originalLength = msg.content.length;
 			msg.content = [
 				{
 					type: 'text',
@@ -756,15 +974,25 @@ function addCacheControlToMessage(msg: any): boolean {
 					cache_control: { type: 'ephemeral' },
 				},
 			];
+			console.log('✅ Converted string content to array with cache_control:', {
+				originalLength,
+				newStructure: 'text block with cache_control',
+			});
 			return true;
 		} else if (typeof msg.content === 'object') {
 			// Content is already an object - add cache_control directly
 			msg.content.cache_control = { type: 'ephemeral' };
+			console.log('✅ Added cache_control to object content:', {
+				hasText: !!msg.content.text,
+				hasType: !!msg.content.type,
+				hasCache: !!msg.content.cache_control,
+			});
 			return true;
 		}
 	} catch (error) {
 		console.log('❌ Failed to add cache_control to message:', error);
 	}
 
+	console.log('❌ Could not add cache_control - unsupported content format');
 	return false;
 }
