@@ -160,18 +160,36 @@ export function handleAgentFinishOutput(
 	if (agentFinishSteps.returnValues) {
 		const isMultiOutput = Array.isArray(agentFinishSteps.returnValues?.output);
 		if (isMultiOutput) {
-			// If all items in the multi-output array are of type 'text', merge them into a single string
-			const multiOutputSteps = agentFinishSteps.returnValues.output as Array<{
-				index: number;
-				type: string;
-				text: string;
-			}>;
-			const isTextOnly = multiOutputSteps.every((output) => 'text' in output);
-			if (isTextOnly) {
-				agentFinishSteps.returnValues.output = multiOutputSteps
-					.map((output) => output.text)
-					.join('\n')
-					.trim();
+			const multiOutputSteps = agentFinishSteps.returnValues.output;
+
+			console.log('🔍 handleAgentFinishOutput Debug:', {
+				isMultiOutput,
+				arrayLength: multiOutputSteps?.length || 0,
+				firstItemKeys: multiOutputSteps?.[0] ? Object.keys(multiOutputSteps[0]) : 'none',
+				firstItemSample: multiOutputSteps?.[0],
+			});
+
+			// Safe processing - only proceed if we have valid array with objects
+			if (Array.isArray(multiOutputSteps) && multiOutputSteps.length > 0) {
+				try {
+					// Filter for items that have 'text' property and extract the text
+					const textItems = multiOutputSteps
+						.filter(
+							(item) => item && typeof item === 'object' && 'text' in item && item.type === 'text',
+						)
+						.map((item) => item.text)
+						.filter((text) => text && typeof text === 'string');
+
+					if (textItems.length > 0) {
+						console.log('🔍 Found', textItems.length, 'text items');
+						agentFinishSteps.returnValues.output = textItems.join('\n').trim();
+					} else {
+						console.log('🔍 No valid text items found, keeping original output');
+					}
+				} catch (error) {
+					console.error('🚨 Error processing multiOutputSteps:', error);
+					// Keep original output on error
+				}
 			}
 			return agentFinishSteps;
 		}

@@ -35,4 +35,12 @@ export const commonOptions: INodeProperties[] = [
 		description:
 			'Whether or not binary images should be automatically passed through to the agent as image type messages',
 	},
+	{
+		displayName: 'Include Raw Data',
+		name: 'includeRawData',
+		type: 'boolean',
+		default: false,
+		description:
+			'Whether to include raw LLM response data with token usage, caching info, and metadata in the output',
+	},
 ];

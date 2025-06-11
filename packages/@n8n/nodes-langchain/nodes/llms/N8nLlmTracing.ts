@@ -96,6 +96,9 @@ export class N8nLlmTracing extends BaseCallbackHandler {
 		// but just in case, we set the index to the length of the runsMap
 		const runDetails = this.runsMap[runId] ?? { index: Object.keys(this.runsMap).length };
 
+		// 完整的原始LLMResult - 用于计费分析 (在处理之前)
+		console.log('📊 LLM Result for Billing:', { runId, tokens: output.llmOutput?.tokenUsage });
+
 		output.generations = output.generations.map((gen) =>
 			gen.map((g) => pick(g, ['text', 'generationInfo'])),
 		);
